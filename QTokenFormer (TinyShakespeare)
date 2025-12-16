@@ -1,0 +1,384 @@
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import pennylane as qml
+from pennylane import numpy as np
+import copy
+import math
+import time
+import os
+import requests
+from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+# Crear carpetas
+os.makedirs("graficas_shakespeare", exist_ok=True)
+os.makedirs("checkpoints_hubo", exist_ok=True)
+
+# ==========================================
+# 1. PREPARACIÓN DE DATOS (TINY SHAKESPEARE)
+# ==========================================
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+def prepare_tinyshakespeare():
+    """Descarga y procesa el dataset TinyShakespeare (Caracteres)"""
+    file_path = 'input.txt'
+    if not os.path.exists(file_path):
+        print("Downloading TinyShakespeare...")
+        data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
+        with open(file_path, 'w') as f:
+            f.write(requests.get(data_url).text)
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    # Crear vocabulario (Caracteres únicos)
+    chars = sorted(list(set(text)))
+    vocab_size = len(chars)
+
+    # Mapeos
+    stoi = { ch:i for i,ch in enumerate(chars) }
+    itos = { i:ch for i,ch in enumerate(chars) }
+
+    # Codificar todo el texto
+    data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
+
+    # Split 90% train / 10% val
+    n = int(0.9 * len(data))
+    train_data = data[:n]
+    val_data = data[n:]
+
+    print(f"✅ Dataset cargado. Vocabulario: {vocab_size} caracteres.")
+    print(f"   Train size: {len(train_data):,} | Val size: {len(val_data):,}")
+
+    return train_data, val_data, vocab_size, stoi, itos
+
+# Variables Globales de Datos (Se llenan al ejecutar)
+TRAIN_DATA = None
+VAL_DATA = None
+
+def get_batch(split, batch_size, seq_len):
+    """Obtiene un batch aleatorio del texto real"""
+    data = TRAIN_DATA if split == 'train' else VAL_DATA
+    # Elegir offsets aleatorios
+    ix = torch.randint(len(data) - seq_len, (batch_size,))
+    # Apilar secuencias
+    x = torch.stack([data[i:i+seq_len] for i in ix])
+    y = torch.stack([data[i+1:i+seq_len+1] for i in ix])
+    return x, y
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=2048):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0); self.register_buffer('pe', pe)
+    def forward(self, x): return x + self.pe[:, :x.size(1), :]
+
+def train_model(model, model_name, n_epochs, steps_per_epoch, batch_size, seq_len, lr):
+    print(f"\n🔹 {model_name} | Params: {count_parameters(model):,}")
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, steps_per_epoch=steps_per_epoch, epochs=n_epochs, pct_start=0.1)
+
+    val_losses = []
+
+    for epoch in range(n_epochs):
+        model.train()
+        for _ in range(steps_per_epoch):
+            inputs, targets = get_batch('train', batch_size, seq_len)
+            optimizer.zero_grad()
+            logits = model(inputs)
+            # Flatten para CrossEntropy: (B*T, Vocab)
+            loss = criterion(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+        # Validación (Estimación sobre 20 batches para velocidad)
+        model.eval(); val_loss_acc = 0; eval_iters = 20
+        with torch.no_grad():
+            for _ in range(eval_iters):
+                inp, tgt = get_batch('val', batch_size, seq_len)
+                logits = model(inp)
+                loss = criterion(logits.view(-1, logits.size(-1)), tgt.view(-1))
+                val_loss_acc += loss.item()
+
+        avg_val = val_loss_acc / eval_iters
+        val_losses.append(avg_val)
+
+        if "Q-HUBO" in model_name and (epoch+1) % 2 == 0:
+            torch.save(model.state_dict(), f"checkpoints_hubo/{model_name}_ep{epoch+1}.pt")
+
+        print(f"   Ep {epoch+1}: Val Loss {avg_val:.4f}")
+
+    parts = model_name.split("-")
+    return {
+        "name": model_name, "type": f"{parts[0]}-{parts[1]}", "scale": parts[2],
+        "val_curve": val_losses, "loss": val_losses[-1], "params": count_parameters(model)
+    }
+
+# ==========================================
+# 2. LÓGICA CUÁNTICA (HUBO v4 - Optimizado)
+# ==========================================
+N_QUBITS = 4
+N_LAYERS = 2
+dev = qml.device("default.qubit", wires=N_QUBITS)
+
+@qml.qnode(dev, interface="torch")
+def circuit_generic(inputs, weights):
+    qml.AngleEmbedding(inputs, wires=range(N_QUBITS))
+    qml.StronglyEntanglingLayers(weights, wires=range(N_QUBITS))
+    return [qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS)]
+
+@qml.qnode(dev, interface="torch")
+def circuit_hubo(inputs, weights):
+    # HUBO: Re-uploading + Rotaciones Y (Reales)
+    qml.AngleEmbedding(inputs, wires=range(N_QUBITS), rotation='Y')
+    qml.BasicEntanglerLayers(weights[0:1], wires=range(N_QUBITS), rotation=qml.RY)
+    # Re-uploading Layer
+    qml.AngleEmbedding(inputs, wires=range(N_QUBITS), rotation='Y')
+    qml.BasicEntanglerLayers(weights[1:2], wires=range(N_QUBITS), rotation=qml.RY)
+    return [qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS)]
+
+class QuantumLinear(nn.Module):
+    """Capa Cuántica Genérica (Naive Init)"""
+    def __init__(self, in_feat, out_feat, n_qubits=N_QUBITS, n_layers=N_LAYERS):
+        super().__init__()
+        self.pre_proj = nn.Linear(in_feat, n_qubits)
+        self.q_layer = qml.qnn.TorchLayer(circuit_generic, {"weights": (n_layers, n_qubits, 3)})
+        self.post_proj = nn.Linear(n_qubits, out_feat)
+        # Init Tóxica (Aleatoria completa [0, 2pi]) para demostrar Barren Plateau
+        with torch.no_grad(): self.q_layer.weights.data.uniform_(0, 2 * np.pi)
+
+    def forward(self, x):
+        x = self.pre_proj(x); x = torch.tanh(x) * (np.pi / 2)
+        b_shape = x.shape
+        q_out = self.q_layer(x.reshape(-1, b_shape[-1])).reshape(b_shape)
+        return self.post_proj(q_out)
+
+class HUBOQuantumLinear(nn.Module):
+    """HUBO v4: Residual + Identity Init + Re-uploading"""
+    def __init__(self, in_feat, out_feat, n_qubits=N_QUBITS, n_layers=N_LAYERS):
+        super().__init__()
+        self.classical_path = nn.Linear(in_feat, out_feat)
+        self.q_norm = nn.LayerNorm(in_feat)
+        self.pre_proj = nn.Linear(in_feat, n_qubits)
+        self.q_layer = qml.qnn.TorchLayer(circuit_hubo, {"weights": (n_layers, n_qubits)})
+        self.post_proj = nn.Linear(n_qubits, out_feat)
+        self.alpha = nn.Parameter(torch.tensor(0.1))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Clásico: Buena inicialización
+        nn.init.xavier_uniform_(self.classical_path.weight); nn.init.zeros_(self.classical_path.bias)
+        # Cuántico: Ortogonal + Identidad (Ceros exactos)
+        nn.init.orthogonal_(self.pre_proj.weight)
+        nn.init.xavier_uniform_(self.post_proj.weight, gain=0.01); nn.init.zeros_(self.post_proj.bias)
+        with torch.no_grad(): self.q_layer.weights.data.fill_(0.0)
+
+    def forward(self, x):
+        out_classical = self.classical_path(x)
+        # Quantum Path con Normalización y Mapeo
+        q_in = torch.atan(self.pre_proj(self.q_norm(x))) * 2.0
+        b_shape = q_in.shape
+        q_out = self.q_layer(q_in.reshape(-1, b_shape[-1])).reshape(b_shape)
+        return out_classical + (self.alpha * self.post_proj(q_out))
+
+# ==========================================
+# 3. ARQUITECTURA UNIVERSAL
+# ==========================================
+class GEGLU(nn.Module):
+    def forward(self, x): x, g = x.chunk(2, dim=-1); return x * F.gelu(g)
+
+class TokenFormerFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(d_model, d_ff*2), GEGLU(), nn.Dropout(dropout), nn.Linear(d_ff, d_model))
+    def forward(self, x): return self.net(x)
+
+class VanillaFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(d_model, d_ff), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_ff, d_model))
+    def forward(self, x): return self.net(x)
+
+# Custom Attention Wrapper
+class CustomAttention(nn.Module):
+    def __init__(self, d_model, nhead, LinearCls):
+        super().__init__()
+        self.nhead = nhead; self.dk = d_model // nhead
+        self.q = LinearCls(d_model, d_model)
+        self.k = LinearCls(d_model, d_model)
+        self.v = LinearCls(d_model, d_model)
+        self.o = LinearCls(d_model, d_model)
+
+    def forward(self, x, mask=None):
+        B, S, D = x.shape
+        Q = self.q(x).view(B, S, self.nhead, self.dk).transpose(1, 2)
+        K = self.k(x).view(B, S, self.nhead, self.dk).transpose(1, 2)
+        V = self.v(x).view(B, S, self.nhead, self.dk).transpose(1, 2)
+
+        # Causal Masking (Obligatorio para Text Generation)
+        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.dk)
+        if mask is not None:
+            # Mask tiene 1s donde atender, 0 donde no.
+            # PyTorch expects True/False or 0/-inf. Ajustamos:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        attn = F.softmax(scores, dim=-1)
+        return self.o((attn @ V).transpose(1, 2).contiguous().view(B, S, D))
+
+class UniversalDecoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, d_ff, dropout, mode):
+        super().__init__()
+        if "Vanilla" in mode: Linear, FFN = nn.Linear, VanillaFeedForward
+        elif "TokenFormer" in mode: Linear, FFN = nn.Linear, TokenFormerFeedForward
+        elif "Q-Generic" in mode: Linear, FFN = QuantumLinear, None
+        elif "Q-HUBO" in mode: Linear, FFN = HUBOQuantumLinear, None
+
+        if "Q-" in mode: self.attn = CustomAttention(d_model, nhead, Linear)
+        else: self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+
+        self.norm1 = nn.LayerNorm(d_model); self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        if FFN: self.ffn = FFN(d_model, d_ff, dropout)
+        else: self.ffn = nn.Sequential(Linear(d_model, d_ff), nn.ReLU(), Linear(d_ff, d_model))
+
+    def forward(self, x, mask):
+        x_norm = self.norm1(x)
+        if isinstance(self.attn, nn.MultiheadAttention):
+            # Para MultiheadAttention nativa, la máscara debe ser booleana o float aditiva
+            # Si mask es (S, S) con 1s y 0s:
+            attn_mask = (mask == 0) # True donde queremos bloquear (inf)
+            attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask, is_causal=True)
+        else:
+            attn_out = self.attn(x_norm, mask=mask)
+
+        x = x + self.dropout(attn_out)
+        x = x + self.dropout(self.ffn(self.norm2(x)))
+        return x
+
+class UniversalTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model, nhead, num_layers, d_ff, max_len, mode):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, d_model)
+        self.pos = PositionalEncoding(d_model, max_len)
+        self.layers = nn.ModuleList([UniversalDecoderLayer(d_model, nhead, d_ff, 0.1, mode) for _ in range(num_layers)])
+        if "Q-HUBO" in mode: self.head = HUBOQuantumLinear(d_model, vocab_size)
+        elif "Q-Generic" in mode: self.head = QuantumLinear(d_model, vocab_size)
+        else: self.head = nn.Linear(d_model, vocab_size)
+        self.d_model = d_model
+
+    def forward(self, x):
+        S = x.size(1)
+        # Máscara Causal: Triángulo inferior de 1s
+        mask = torch.tril(torch.ones(S, S)).to(x.device)
+        x = self.pos(self.emb(x) * math.sqrt(self.d_model))
+        for layer in self.layers: x = layer(x, mask)
+        return self.head(x)
+
+# ==========================================
+# 4. EJECUCIÓN (Tiny Shakespeare)
+# ==========================================
+# 1. Cargar Datos
+TRAIN_DATA, VAL_DATA, VOCAB_SIZE, STOI, ITOS = prepare_tinyshakespeare()
+
+# 2. Configuración
+# d_model=32 y 4 qubits es el sweet spot para simulación rápida pero no trivial
+SEQ_LEN = 32
+BATCH_SIZE = 32
+N_EPOCHS = 10
+STEPS = 50 # Pasos por época (reducido para que corra en < 1h)
+LR = 3e-3
+
+print("--- 🏁 INICIANDO ENTRENAMIENTO (Tiny Shakespeare) ---")
+
+results = []
+configs = [
+    # Acto 1: Clásicos
+    ("C-Vanilla-Medium", {"d_model": 32, "nhead": 4, "num_layers": 2, "d_ff": 64}),
+    ("C-TokenFormer-Tiny", {"d_model": 32, "nhead": 4, "num_layers": 1, "d_ff": 64}),
+    ("C-TokenFormer-Medium", {"d_model": 32, "nhead": 4, "num_layers": 2, "d_ff": 64}),
+
+    # Acto 2: Cuánticos
+    ("Q-Generic-Tiny", {"d_model": 32, "nhead": 4, "num_layers": 1, "d_ff": 32}),
+    ("Q-Generic-Medium", {"d_model": 32, "nhead": 4, "num_layers": 2, "d_ff": 32}),
+
+    # Acto 3: HUBO
+    ("Q-HUBO-Tiny", {"d_model": 32, "nhead": 4, "num_layers": 1, "d_ff": 32}),
+    ("Q-HUBO-Medium", {"d_model": 32, "nhead": 4, "num_layers": 2, "d_ff": 32}),
+]
+
+for name, cfg in configs:
+    set_seed(42)
+    mode = "-".join(name.split("-")[:2])
+    model = UniversalTransformer(VOCAB_SIZE, cfg["d_model"], cfg["nhead"], cfg["num_layers"], cfg["d_ff"], SEQ_LEN, mode)
+    this_lr = 5e-3 if "Q-Generic" in name else LR
+    results.append(train_model(model, name, N_EPOCHS, STEPS, BATCH_SIZE, SEQ_LEN, this_lr))
+
+# ==========================================
+# 5. GENERACIÓN DE GRÁFICAS
+# ==========================================
+df = pd.DataFrame(results)
+save_dir = Path("graficas_shakespeare")
+
+def plot_compare(filter_names, title, filename):
+    plt.figure(figsize=(10, 6))
+    subset = df[df["name"].isin(filter_names)]
+    colors = {"C-Vanilla": "blue", "C-TokenFormer": "green", "Q-Generic": "orange", "Q-HUBO": "red"}
+    styles = {"Tiny": "--", "Medium": "-"}
+
+    for _, row in subset.iterrows():
+        lbl = row['name']
+        c_key = "-".join(lbl.split("-")[:2])
+        s_key = lbl.split("-")[-1]
+        plt.plot(row['val_curve'], label=lbl, color=colors[c_key], linestyle=styles[s_key], linewidth=2.5)
+
+    plt.title(title, fontsize=14); plt.xlabel("Época"); plt.ylabel("Loss"); plt.legend(); plt.grid(True, alpha=0.3)
+    plt.savefig(save_dir / filename)
+    plt.show()
+
+print("\n--- 📊 GENERANDO GRÁFICAS ---")
+plot_compare(["C-Vanilla-Medium", "C-TokenFormer-Tiny", "C-TokenFormer-Medium"],
+             "1. Mejora Clásica (Shakespeare)", "1_classic_scaling.png")
+
+plot_compare(["C-TokenFormer-Tiny", "C-TokenFormer-Medium", "Q-Generic-Tiny", "Q-Generic-Medium"],
+             "2. Reto Cuántico (Shakespeare)", "2_classic_vs_quantum.png")
+
+plot_compare(["Q-Generic-Tiny", "Q-Generic-Medium", "Q-HUBO-Tiny", "Q-HUBO-Medium"],
+             "3. Solución HUBO (Shakespeare)", "3_hubo_effect.png")
+
+# Generación de Texto de Prueba
+print("\n--- 🎭 GENERACIÓN DE TEXTO (Shakespeare) ---")
+def generate_text(model, start_str, max_len=100):
+    model.eval()
+    context = torch.tensor([STOI[c] for c in start_str], dtype=torch.long).unsqueeze(0)
+    for _ in range(max_len):
+        # Crop context
+        ctx_crop = context[:, -SEQ_LEN:]
+        logits = model(ctx_crop)
+        logits = logits[:, -1, :]
+        probs = F.softmax(logits, dim=-1)
+        next_idx = torch.multinomial(probs, num_samples=1)
+        context = torch.cat((context, next_idx), dim=1)
+    return "".join([ITOS[i.item()] for i in context[0]])
+
+# Generamos con el mejor modelo HUBO
+best_hubo_idx = df[df["name"]=="Q-HUBO-Medium"].index[0]
+best_hubo_model = results[best_hubo_idx]["model_instance"]
+print(f"Generado por Q-HUBO:\n{generate_text(best_hubo_model, 'To be or not to ')}")
